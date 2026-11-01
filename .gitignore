@@ -1,0 +1,25 @@
+# 构建产物
+build/
+build_installer/
+dist/
+dist_installer/
+payload.zip
+*.spec.bak
+
+# 缓存
+__pycache__/
+*.pyc
+
+# 日志与临时
+*.log
+log.txt
+wxsetup_out.txt
+integrity_new.json
+
+# 测试残留
+probe*.py
+probe*.txt
+test_*.py
+smoke_*.py
+shot*.png
+collect_out.txt
