@@ -5,6 +5,15 @@
 
 > 仅用于导出**你自己账号**在本机已有的聊天记录。请勿用于导出他人数据。
 
+## 下载安装
+
+不用装 Python，直接下安装包：
+
+**[⬇ 微信导出工具 安装包（v1.0.0）](https://github.com/zhihui09/wechat-chat-exporter/releases/latest)**
+
+下载 `WeChat-Exporter-Setup-1.0.0.exe`，双击安装，桌面会出现快捷方式。
+安装到 `%LOCALAPPDATA%\微信导出工具`，不需要管理员；卸载运行目录下的 `卸载.cmd`。
+
 ## 功能
 
 - 只列一对一联系人（好友 / 陌生人），自动排除群聊、公众号、系统号
