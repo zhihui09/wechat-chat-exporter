@@ -1,4 +1,5 @@
 # 构建产物
+ffmpeg.exe
 build/
 build_installer/
 dist/
@@ -23,3 +24,10 @@ test_*.py
 smoke_*.py
 shot*.png
 collect_out.txt
+_emoout/
+_imgout/
+_ref/
+_*
+_*.py
+integrity.json
+e2e_args.txt

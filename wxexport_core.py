@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import atexit
+import concurrent.futures
 import datetime
 import functools
 import hashlib
@@ -19,8 +20,12 @@ import os
 import re
 import shutil
 import sqlite3
+import struct
 import subprocess
+import sys
 import tempfile
+import threading
+import time
 import zlib
 import traceback
 from pathlib import Path
@@ -28,6 +33,17 @@ from typing import Callable, Iterable
 
 VENDOR = Path(__file__).resolve().parent / "vendor" / "wechat4-db-decrypt"
 PAGE_SZ = 4096
+
+# 打包成 GUI 程序（无控制台）后，每调一次 ffmpeg 就会新开一个控制台窗口；
+# 并发导出图片时表现为「一堆黑窗一闪一闪地弹出来又消失」。
+if os.name == "nt":
+    _NO_WINDOW = 0x08000000  # CREATE_NO_WINDOW
+    _NO_WINDOW_SI = subprocess.STARTUPINFO()
+    _NO_WINDOW_SI.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    _NO_WINDOW_SI.wShowWindow = 0  # SW_HIDE
+else:
+    _NO_WINDOW = 0
+    _NO_WINDOW_SI = None
 
 
 class ExportCancelled(Exception):
@@ -517,6 +533,7 @@ class Exporter:
         self.keys: dict[str, str] = {}
         self.db_dir: Path | None = None
         self.contacts: list[dict] = []
+        self.image_uin: int | None = None   # 图片/表情包密钥共用的 seed
 
     # ---- 1. 密钥 + 解密 ----
     def prepare(self) -> Path:
@@ -867,9 +884,686 @@ class Exporter:
     def _session_hash(self, wxid: str) -> str:
         return hashlib.md5(wxid.encode()).hexdigest()
 
+    # ---- 5.1 图片：V2 .dat 解密 ----
+    # 微信 4.x 的 Img/*.dat 是 V2 加密：
+    #   [6B 07 08 56 32 08 07][4B aes_size LE][4B xor_size LE][1B pad]
+    #   + AES-128-ECB 段 + 明文段 + XOR 段
+    # 密钥不读进程内存，用账号 uin 派生（同一套算法 Windows/macOS 通用）：
+    #   xor_key = uin & 0xFF
+    #   aes_key = MD5(str(uin) + wxid).hexdigest()[:16]
+    # uin 不在磁盘上，用 xor_key 把枚举压到 2^24，再用图片 magic 校验命中。
+    V2_MAGIC = b"\x07\x08\x56\x32\x08\x07"
+    IMG_TIMEOUT = 60          # 单个 ffmpeg 转换上限（秒）
+
+    def _img_cache_path(self) -> Path:
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home())
+        return Path(base) / "微信导出工具" / "image_key.json"
+
+    def _load_cached_image_key(self, wxid: str):
+        """返回 (xor_key, aes_key, uin)。uin 可能为空（老版本缓存只存了前两项）。"""
+        try:
+            data = json.loads(self._img_cache_path().read_text(encoding="utf-8"))
+            item = data.get(wxid) or {}
+            if item.get("xor") is not None and item.get("aes"):
+                uin = item.get("uin")
+                return (int(item["xor"]), str(item["aes"]),
+                        int(uin) if uin else None)
+        except Exception:
+            pass
+        return None
+
+    def _save_cached_image_key(self, wxid: str, xor_key: int, aes_key: str,
+                               uin: int | None = None) -> None:
+        try:
+            p = self._img_cache_path()
+            data = {}
+            if p.exists():
+                try:
+                    data = json.loads(p.read_text(encoding="utf-8"))
+                except Exception:
+                    data = {}
+            data[wxid] = {"xor": xor_key, "aes": aes_key,
+                          **({"uin": uin} if uin else {})}
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                         encoding="utf-8")
+        except Exception:
+            pass
+
+    @staticmethod
+    def _img_magic_ok(block: bytes) -> bool:
+        """严格判断解密后是不是图片。宽松判断会被随机字节撞出假阳性。"""
+        return (block[:3] == b"\xff\xd8\xff"
+                or block[:8] == b"\x89PNG\r\n\x1a\n"
+                or block[:4] == b"GIF8"
+                or (block[:4] == b"RIFF" and block[8:12] == b"WEBP")
+                or block[:4] == b"wxgf")
+
+    @staticmethod
+    def _aes_block(aes_key: str, block: bytes) -> bytes:
+        from Crypto.Cipher import AES
+        return AES.new(aes_key.encode("ascii")[:16], AES.MODE_ECB).decrypt(block)
+
+    def _v2_samples(self, attach_dir: Path, n: int = 4) -> list[bytes]:
+        """取几张原图首块（AES 段前 16 字节）当密钥验证模板。"""
+        out: list[bytes] = []
+        if not attach_dir.is_dir():
+            return out
+        for p in attach_dir.rglob("Img/*.dat"):
+            if p.name.endswith("_t.dat"):
+                continue
+            try:
+                raw = p.open("rb").read(31)
+            except OSError:
+                continue
+            if len(raw) < 31 or raw[:6] != self.V2_MAGIC:
+                continue
+            out.append(raw[15:31])
+            if len(out) >= n:
+                break
+        return out
+
+    def _vote_xor_key(self, attach_dir: Path, sample: int = 40) -> int | None:
+        """缩略图几乎都是 JPG，末字节 = 0xD9 ^ xor_key，投票取多数。"""
+        from collections import Counter
+        votes: Counter = Counter()
+        if not attach_dir.is_dir():
+            return None
+        for p in attach_dir.rglob("Img/*_t.dat"):
+            try:
+                with p.open("rb") as fp:
+                    if fp.read(6) != self.V2_MAGIC:
+                        continue
+                    fp.seek(-1, 2)
+                    votes[fp.read(1)[0] ^ 0xD9] += 1
+            except OSError:
+                continue
+            if sum(votes.values()) >= sample:
+                break
+        if not votes:
+            return None
+        return votes.most_common(1)[0][0]
+
+    def _account_wxid(self) -> str:
+        """登录账号的 wxid（从 db_storage 的上级目录名取，去掉随机后缀）。
+
+        图片密钥按**账号**派生，不是按会话；用会话 wxid 去枚举永远不命中。
+        """
+        if not self.db_dir:
+            return ""
+        name = self.db_dir.parent.name
+        m = re.match(r"^(wxid_[^_]+)", name, re.IGNORECASE)
+        return m.group(1) if m else name
+
+    def derive_image_key(self, wxid: str, attach_dir: Path,
+                         progress: Callable[[float, str], None] | None = None,
+                         cancel: Callable[[], bool] | None = None,
+                         time_budget: float = 180.0) -> tuple[int, str, int | None] | None:
+        """拿本账号的 (xor_key, aes_key, uin)。成功会写缓存，下次秒开。
+
+        uin 就是表情包密钥要用的 seed，顺手一起缓存，免得再枚举一遍。
+        """
+        if cancel and cancel():
+            raise ExportCancelled("已取消")
+        cached = self._load_cached_image_key(wxid)
+        if cached and cached[2] is not None:
+            blocks = self._v2_samples(attach_dir, 2)
+            if all(self._img_magic_ok(self._aes_block(cached[1], b)) for b in blocks):
+                self.log("图片密钥：用缓存的")
+                self.image_uin = cached[2]
+                return cached
+            self.log("图片密钥：缓存对不上，重新推导")
+        elif cached:
+            self.log("图片密钥：老缓存缺 uin（表情包要用），重新推导一次")
+        samples = self._v2_samples(attach_dir, 4)
+        if not samples:
+            self.log("图片密钥：没找到可验证的 V2 样本，跳过图片")
+            return None
+        xor_key = self._vote_xor_key(attach_dir)
+        if xor_key is None:
+            self.log("图片密钥：缩略图投票失败，跳过图片")
+            return None
+        self.log(f"图片密钥：xor={xor_key}，开始枚举 uin（约 1-2 分钟）")
+        suf = wxid.encode()
+        started = time.time()
+        tried = 0
+        for uin in range(xor_key, 1 << 32, 256):
+            if cancel and cancel():
+                raise ExportCancelled("已取消")
+            tried += 1
+            if tried % 250000 == 0:
+                if time.time() - started > time_budget:
+                    self.log("图片密钥：超时未命中，跳过图片")
+                    return None
+                if progress:
+                    progress(min(95.0, tried * 100.0 / (1 << 24)),
+                             f"正在推导图片密钥 {tried * 100 // (1 << 24)}%")
+            key = hashlib.md5(str(uin).encode() + suf).hexdigest()[:16]
+            aes = self._aes_block(key, samples[0])
+            if not self._img_magic_ok(aes):
+                continue
+            if all(self._img_magic_ok(self._aes_block(key, b)) for b in samples[1:]):
+                self.log(f"图片密钥：命中 uin={uin}，用时 {time.time()-started:.0f}s")
+                self._save_cached_image_key(wxid, xor_key, key, uin)
+                self.image_uin = uin
+                return xor_key, key, uin
+        self.log("图片密钥：枚举完没命中，跳过图片")
+        return None
+
+    @staticmethod
+    def _strip_pkcs7(data: bytes) -> bytes:
+        if not data:
+            return data
+        pad = data[-1]
+        if 0 < pad <= 16 and data[-pad:] == bytes([pad]) * pad:
+            return data[:-pad]
+        return data
+
+    def decrypt_dat(self, raw: bytes, xor_key: int, aes_key: str) -> bytes | None:
+        """V2 .dat -> 原始字节（可能是 JPEG/PNG/GIF/WEBP，也可能是 wxgf 容器）。"""
+        if len(raw) < 0x0F + 16 or raw[:6] != self.V2_MAGIC:
+            return None
+        aes_size, xor_size = struct.unpack("<II", raw[6:14])
+        payload = raw[15:]
+        # 微信按 PKCS7 补齐整个密文块：aes_size 是 16 的倍数时还要多读一块，
+        # 否则会从明文段里多吃 16 字节（实测会把 PNG 的 chunk 链截断）。
+        aligned = aes_size + (16 - aes_size % 16)
+        if aligned > len(payload):
+            return None
+        try:
+            plain = self._strip_pkcs7(self._aes_block(aes_key, payload[:aligned]))
+        except Exception:
+            return None
+        rest = payload[aligned:]
+        if xor_size and xor_size <= len(rest):
+            raw_part = rest[:len(rest) - xor_size]
+            tail = bytes(b ^ xor_key for b in rest[len(rest) - xor_size:])
+            data = plain + raw_part + tail
+        else:
+            data = plain + rest
+        return self._trim_to_image_end(data)
+
+    @staticmethod
+    def _trim_to_image_end(data: bytes) -> bytes:
+        """裁掉尾部零星脏字节。
+
+        实测：JPEG 约七成文件末尾会多出 24 字节（PNG 不受影响）。
+        按「最后一个结束标记」截断后，实测 270/270 张都能被正常解码。
+        """
+        if data[:3] == b"\xff\xd8\xff":
+            if data[-2:] != b"\xff\xd9":
+                j = data.rfind(b"\xff\xd9")
+                if j > 0:
+                    return data[:j + 2]
+        elif data[:8] == b"\x89PNG\r\n\x1a\n":
+            if b"IEND" not in data[-16:]:
+                j = data.rfind(b"IEND")
+                if j > 0:
+                    return data[:j + 8]
+        elif data[:4] == b"GIF8" and data[-1:] != b"\x3b":
+            j = data.rfind(b"\x3b")
+            if j > 0:
+                return data[:j + 1]
+        return data
+
+    @staticmethod
+    def _find_image_magic(data: bytes, limit: int = 4096):
+        """wxgf 里可能直接嵌了 JPEG/PNG。返回 (偏移, 扩展名) 或 None。"""
+        end = min(len(data) - 12, limit)
+        for i in range(4, end):
+            if data[i] == 0xFF and data[i + 1] == 0xD8 and data[i + 2] == 0xFF:
+                return i, ".jpg"
+            if data[i:i + 4] == b"\x89PNG":
+                return i, ".png"
+        return None
+
+    @staticmethod
+    def find_ffmpeg() -> str | None:
+        cands = []
+        env = os.environ.get("WXE_FFMPEG")
+        if env:
+            cands.append(env)
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            cands.append(str(Path(meipass) / "ffmpeg.exe"))
+        here = Path(sys.executable).parent
+        cands += [str(here / "ffmpeg.exe"), str(Path(__file__).parent / "ffmpeg.exe")]
+        for c in cands:
+            if c and Path(c).is_file():
+                return c
+        return shutil.which("ffmpeg")
+
+    def wxgf_to_jpg(self, data: bytes) -> bytes | None:
+        """wxgf 容器里是 HEVC 单帧，用 ffmpeg 转 JPG。没有 ffmpeg 就返回 None。"""
+        ff = self.find_ffmpeg()
+        if not ff:
+            return None
+        payload = data[16:]
+        if len(payload) < 200:
+            payload = data[4:]
+        tmpd = Path(tempfile.mkdtemp(prefix="wxe_img_"))
+        src, dst = tmpd / "a.hevc", tmpd / "a.jpg"
+        try:
+            src.write_bytes(payload)
+            # CREATE_NO_WINDOW：GUI 里并发调 ffmpeg 时，不隐藏会一闪一闪弹一堆黑窗
+            subprocess.run([ff, "-v", "error", "-y", "-i", str(src),
+                            "-frames:v", "1", "-q:v", "2", str(dst)],
+                           capture_output=True, timeout=self.IMG_TIMEOUT,
+                           creationflags=_NO_WINDOW, startupinfo=_NO_WINDOW_SI)
+            if dst.is_file() and dst.stat().st_size > 512:
+                return dst.read_bytes()
+        except Exception:
+            return None
+        finally:
+            shutil.rmtree(tmpd, ignore_errors=True)
+        return None
+
+    def _gather_images(self, attach_root: Path, wxid: str, months: set[str],
+                       outdir: Path, limit: int,
+                       progress: Callable[[float, str], None] | None,
+                       cancel: Callable[[], bool] | None) -> dict:
+        """按「会话哈希 + 月份」解出该会话的图片。
+
+        原图解不出（wxgf 且没有 ffmpeg）时退回同名缩略图，保证每一张都有东西看。
+        """
+        stats = {"图片": 0, "缩略图": 0, "跳过": 0}
+        direct = attach_root / "attach" / self._session_hash(wxid) / "Img"
+        # 兼容「月份目录在会话哈希下」和「会话哈希在月份下」两种布局
+        if not direct.is_dir():
+            alt = attach_root / "attach" / self._session_hash(wxid)
+            if alt.is_dir():
+                direct = alt
+            else:
+                self.log(f"没找到该会话的图片目录：{direct}")
+                return stats
+
+        files: list[Path] = []
+        for month in sorted(months):
+            d = direct / month / "Img"
+            if not d.is_dir():
+                d = direct / "Img" / month
+            if d.is_dir():
+                files += [p for p in d.glob("*.dat") if not p.name.endswith("_t.dat")]
+        if not files:
+            self.log("该会话这些月份里没有图片")
+            return stats
+
+        account = self._account_wxid() or wxid
+        key = self.derive_image_key(account, direct if direct.name == "Img" else direct.parent,
+                                    progress=progress, cancel=cancel)
+        if not key:
+            stats["跳过"] = len(files)
+            return stats
+        xor_key, aes_key, _uin = key
+        total = len(files)
+        self.log(f"图片 {total} 张，开始解密（ffmpeg={'有' if self.find_ffmpeg() else '无'}）")
+
+        dst = outdir / "media" / "图片"
+        dst.mkdir(parents=True, exist_ok=True)
+        thumb_dir = dst / "缩略图"
+        lock = threading.Lock()
+        done = [0]
+
+        def one(p: Path) -> None:
+            if cancel and cancel():
+                raise ExportCancelled("已取消")
+            got = False
+            try:
+                raw = p.read_bytes()
+            except OSError:
+                raw = None
+            data = self.decrypt_dat(raw, xor_key, aes_key) if raw else None
+            ext = None
+            if data:
+                if data[:4] == b"wxgf":
+                    hit = self._find_image_magic(data)
+                    if hit:
+                        data = data[hit[0]:]
+                        ext = hit[1]
+                    else:
+                        jpg = self.wxgf_to_jpg(data)
+                        if jpg:
+                            data, ext = jpg, ".jpg"
+                elif self._img_magic_ok(data):
+                    ext = (".jpg" if data[:3] == b"\xff\xd8\xff" else
+                           ".png" if data[:8] == b"\x89PNG\r\n\x1a\n" else
+                           ".gif" if data[:4] == b"GIF8" else
+                           ".webp" if data[:4] == b"RIFF" else None)
+            if ext and data:
+                try:
+                    (dst / f"{p.stem}{ext}").write_bytes(data)
+                    with lock:
+                        stats["图片"] += 1
+                    return
+                except OSError:
+                    pass
+            # 原图解不出来，就用同名缩略图兜底
+            thumb = p.with_name(p.stem + "_t.dat")
+            if thumb.is_file():
+                try:
+                    t = self.decrypt_dat(thumb.read_bytes(), xor_key, aes_key)
+                except OSError:
+                    t = None
+                if t and self._img_magic_ok(t):
+                    text = (".jpg" if t[:3] == b"\xff\xd8\xff" else
+                            ".png" if t[:8] == b"\x89PNG\r\n\x1a\n" else None)
+                    if text:
+                        thumb_dir.mkdir(parents=True, exist_ok=True)
+                        (thumb_dir / f"{p.stem}{text}").write_bytes(t)
+                        with lock:
+                            stats["缩略图"] += 1
+                        got = True
+            if not got:
+                with lock:
+                    stats["跳过"] += 1
+
+        workers = min(8, max(2, (os.cpu_count() or 4)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = {pool.submit(one, p): p for p in files}
+            for fut in concurrent.futures.as_completed(futs):
+                done[0] += 1
+                if progress and (done[0] % 10 == 0 or done[0] == total):
+                    progress(done[0] * 100.0 / total,
+                             f"正在解密图片 {done[0]}/{total}")
+                if cancel and cancel():
+                    for f in futs:
+                        f.cancel()
+                    raise ExportCancelled("已取消")
+                try:
+                    fut.result()
+                except ExportCancelled:
+                    raise
+                except Exception:
+                    with lock:
+                        stats["跳过"] += 1
+        self.log(f"  图片：{stats['图片']} 张原图、{stats['缩略图']} 张缩略图、"
+                 f"{stats['跳过']} 张解不开")
+        return stats
+
+    # ---- 表情包（账号级，AES-128-CBC key=IV）----
+    # 布局：business/emoticon/{Persist,PersistStore,Thumb,ThumbStore}，文件名是内容 md5。
+    # 密钥：key = md5(seed + 账号wxid + "EMOTICON") 的原始前 16 字节，seed 就是图片用的 uin。
+    # PersistStore 里是多个表情拼在一起的容器，按魔数 + 结构结束位置切开。
+    EMO_SUBDIRS = ("Persist", "PersistStore")
+
+    @staticmethod
+    def _emo_fmt(dec: bytes) -> str:
+        if dec[:8] == b"\x89PNG\r\n\x1a\n":
+            return "png"
+        if dec[:6] in (b"GIF87a", b"GIF89a"):
+            return "gif"
+        if dec[:3] == b"\xff\xd8\xff":
+            return "jpg"
+        if dec[:4] == b"wxgf":
+            return "wxgf"
+        if dec[:4] == b"RIFF":
+            return "webp"
+        return ""
+
+    @staticmethod
+    def _emoticon_key(uin: int, wxid: str) -> bytes:
+        d = hashlib.md5(f"{uin}{wxid}EMOTICON".encode()).hexdigest()
+        return bytes.fromhex(d)[:16]
+
+    def _decrypt_emo_file(self, path: Path, key: bytes) -> bytes | None:
+        from Crypto.Cipher import AES
+
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            return None
+        if len(raw) < 32 or len(raw) % 16:
+            return None
+        try:
+            dec = AES.new(key, AES.MODE_CBC, key).decrypt(raw)
+        except Exception:
+            return None
+        dec = self._strip_pkcs7(dec)
+        return dec if self._emo_fmt(dec) else None
+
+    # --- 容器分割：只认能完整解析到结构结束的魔数，避免压缩数据里的误匹配 ---
+    @staticmethod
+    def _emo_split_png(data: bytes, start: int) -> int | None:
+        if data[start:start + 8] != b"\x89PNG\r\n\x1a\n":
+            return None
+        pos, n = start + 8, len(data)
+        while pos + 8 <= n:
+            ln = struct.unpack(">I", data[pos:pos + 4])[0]
+            typ = data[pos + 4:pos + 8]
+            if pos + 12 + ln > n:
+                return None
+            if typ == b"IEND":
+                return pos + 12 + ln
+            pos += 12 + ln
+        return None
+
+    @staticmethod
+    def _emo_split_gif(data: bytes, start: int) -> int | None:
+        if data[start:start + 6] not in (b"GIF87a", b"GIF89a"):
+            return None
+        pos, n = start + 6, len(data)
+        if pos + 7 > n:
+            return None
+        flags = data[pos + 4]
+        pos += 7
+        if flags & 0x80:
+            pos += 3 * (2 ** ((flags & 0x07) + 1))
+        while pos < n:
+            b = data[pos]
+            if b == 0x3B:
+                return pos + 1
+            if b == 0x21:
+                pos += 2
+            elif b == 0x2C:
+                if pos + 10 > n:
+                    return None
+                pos += 10
+                if data[pos - 1] & 0x80:
+                    pos += 3 * (2 ** ((data[pos - 1] & 0x07) + 1))
+                if pos >= n:
+                    return None
+                pos += 1
+            else:
+                return None
+            while pos < n:
+                sz = data[pos]
+                pos += 1
+                if sz == 0:
+                    break
+                pos += sz
+            if pos > n:
+                return None
+        return None
+
+    @staticmethod
+    def _emo_split_jpeg(data: bytes, start: int) -> int | None:
+        if data[start:start + 2] != b"\xff\xd8":
+            return None
+        pos, n = start + 2, len(data)
+        while pos + 2 <= n:
+            if data[pos] != 0xFF:
+                pos += 1
+                continue
+            marker = data[pos + 1]
+            if marker == 0x00:
+                pos += 2
+                continue
+            if marker == 0xD9:
+                return pos + 2
+            if marker == 0x01 or 0xD0 <= marker <= 0xD7:
+                pos += 2
+                continue
+            if pos + 4 > n:
+                return None
+            seg = struct.unpack(">H", data[pos + 2:pos + 4])[0]
+            if seg < 2 or pos + 2 + seg > n:
+                return None
+            pos += 2 + seg
+        return None
+
+    @classmethod
+    def _emo_magic_at(cls, data: bytes, i: int) -> str:
+        if data[i:i + 8] == b"\x89PNG\r\n\x1a\n":
+            return "png"
+        if data[i:i + 6] in (b"GIF87a", b"GIF89a"):
+            return "gif"
+        if data[i:i + 2] == b"\xff\xd8":
+            return "jpg"
+        if data[i:i + 4] == b"wxgf":
+            return "wxgf"
+        if data[i:i + 4] == b"RIFF":
+            return "webp"
+        return ""
+
+    @classmethod
+    def _split_emo_container(cls, data: bytes) -> list[bytes]:
+        parts, i, n = [], 0, len(data)
+        while i < n - 3:
+            ext = cls._emo_magic_at(data, i)
+            if not ext:
+                i += 1
+                continue
+            if ext == "png":
+                end = cls._emo_split_png(data, i)
+            elif ext == "gif":
+                end = cls._emo_split_gif(data, i)
+            elif ext == "jpg":
+                end = cls._emo_split_jpeg(data, i)
+            else:  # wxgf / webp 结构不定，切到下一个魔数
+                end = next((j for j in range(i + 4, n - 3)
+                            if cls._emo_magic_at(data, j)), n)
+            if end is None or end - i < 16:
+                i += 1
+                continue
+            parts.append(data[i:end])
+            i = end
+        return parts
+
+    def _emo_db_meta(self) -> dict:
+        """从已解密的 emoticon.db 取包名/图注/顺序；拿不到就返回空（退回 md5 命名）。"""
+        meta = {"packs": {}, "captions": {}, "files": {}, "fav": set()}
+        db = (self.dec_dir / "emoticon" / "emoticon.db") if self.dec_dir else None
+        if not db or not db.is_file():
+            self.log("表情包：没拿到 emoticon.db，按 md5 命名")
+            return meta
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            cur = con.cursor()
+            meta["packs"] = dict(cur.execute(
+                "SELECT package_id_, package_name_ FROM kStoreEmoticonPackageTable"))
+            for pid, md5, _lang, cap in cur.execute(
+                    "SELECT package_id_, md5_, language_, caption_ "
+                    "FROM kStoreEmoticonCaptionsTable"):
+                meta["captions"][md5] = cap
+            for pid, md5, _t, sort in cur.execute(
+                    "SELECT package_id_, md5_, type_, sort_order_ "
+                    "FROM kStoreEmoticonFilesTable"):
+                meta["files"][md5] = (pid, sort)
+            meta["fav"] = {r[0] for r in cur.execute(
+                "SELECT md5 FROM kNonStoreEmoticonTable")}
+            con.close()
+        except Exception as e:
+            self.log(f"表情包：读 emoticon.db 失败（{type(e).__name__}），按 md5 命名")
+        return meta
+
+    def gather_emoticons(self, outdir: Path,
+                         cancel: Callable[[], bool] | None = None,
+                         progress: Callable[[float, str], None] | None = None) -> dict:
+        """把本账号的表情包解密导出到 media/表情包/，按包名 + 图注命名。"""
+        stats = {"表情": 0, "跳过": 0}
+        if not self.db_dir:
+            return stats
+        emo_dir = self.db_dir.parent / "business" / "emoticon"
+        if not emo_dir.is_dir():
+            self.log("表情包：本机没有 business/emoticon 目录，跳过")
+            return stats
+        uin = self.image_uin
+        acc = self._account_wxid()
+        if uin is None or not acc:
+            self.log("表情包：没拿到 uin，跳过（图片密钥推导成功后才可导出）")
+            return stats
+        key = self._emoticon_key(uin, acc)
+
+        pat = re.compile(r"^([0-9a-f]{32})(\.thumb)?$")
+        targets: list[tuple[str, Path]] = []
+        for sub in self.EMO_SUBDIRS:
+            d = emo_dir / sub
+            if not d.is_dir():
+                continue
+            for p in d.rglob("*"):
+                m = pat.match(p.name)
+                if p.is_file() and m:
+                    targets.append((m.group(1), p))
+        if not targets:
+            self.log("表情包：没找到加密文件")
+            return stats
+
+        # 先验一把密钥：随便解一个，看魔数对不对
+        probe = None
+        for _md5, p in targets[:6]:
+            probe = self._decrypt_emo_file(p, key)
+            if probe:
+                break
+        if not probe:
+            self.log("表情包：密钥对不上（微信版本可能不同），跳过")
+            return stats
+
+        files: dict[str, bytes] = {}
+        total = len(targets)
+        for i, (md5, p) in enumerate(targets, 1):
+            if cancel and cancel():
+                raise ExportCancelled("已取消")
+            if progress and (i % 20 == 0 or i == total):
+                progress(i * 100.0 / total, f"正在解密表情包 {i}/{total}")
+            data = self._decrypt_emo_file(p, key)
+            if not data:
+                stats["跳过"] += 1
+                continue
+            if p.parent.name == "PersistStore":
+                for part in self._split_emo_container(data):
+                    files.setdefault(hashlib.md5(part).hexdigest(), part)
+            else:
+                files.setdefault(md5, data)
+
+        meta = self._emo_db_meta()
+        dst_root = outdir / "media" / "表情包"
+        clean = lambda s: (re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", str(s)).strip()
+                           or "未命名")
+        for md5, data in files.items():
+            if cancel and cancel():
+                raise ExportCancelled("已取消")
+            fmt = self._emo_fmt(data)
+            if fmt == "wxgf":
+                jpg = self.wxgf_to_jpg(data)
+                if not jpg:
+                    stats["跳过"] += 1
+                    continue
+                data, fmt = jpg, "jpg"
+            if md5 in meta["files"]:
+                pid, sort = meta["files"][md5]
+                pkg = clean(meta["packs"].get(pid) or pid or "未命名包")
+                cap = clean(meta["captions"].get(md5) or md5[:8])
+                sub = dst_root / pkg
+                name = f"{int(sort or 0):03d}_{cap}.{fmt}"
+            elif md5 in meta["fav"]:
+                sub = dst_root / "收藏"
+                name = f"{md5[:8]}.{fmt}"
+            else:
+                sub = dst_root / "其他"
+                name = f"{md5[:8]}.{fmt}"
+            sub.mkdir(parents=True, exist_ok=True)
+            try:
+                (sub / name).write_bytes(data)
+                stats["表情"] += 1
+            except OSError:
+                stats["跳过"] += 1
+        self.log(f"  表情包：{stats['表情']} 个（{stats['跳过']} 个解不开）")
+        return stats
+
     def gather_media(self, msgs: list[dict], outdir: Path,
                      target_wxid: str = "", limit: int = 5000,
-                     cancel: Callable[[], bool] | None = None) -> dict:
+                     cancel: Callable[[], bool] | None = None,
+                     progress: Callable[[float, str], None] | None = None) -> dict:
         """把该会话的图片/视频/文件复制到 outdir/media，并按类型分好。
 
         只按「会话哈希 + 月份」定位，不做逐条消息对齐；不改动任何原文件。
@@ -887,6 +1581,17 @@ class Exporter:
             self.log("消息里没有时间戳，跳过媒体归集")
             return stats
         self.log(f"涉及 {len(months)} 个月份，在 {root} 下归集附件")
+
+        if target_wxid:
+            try:
+                img = self._gather_images(root, target_wxid, months, outdir,
+                                          limit, progress, cancel)
+                stats["图片"] = img["图片"]
+                stats["缩略图"] = img["缩略图"]
+            except ExportCancelled:
+                raise
+            except Exception:
+                self.log("图片归集失败：\n" + traceback.format_exc())
 
         want = {k: outdir / "media" / k for k in ("视频", "文件")}
         for d in want.values():

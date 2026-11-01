@@ -4,7 +4,7 @@ $dst  = "C:\Users\QQQQQ\Desktop\微信导出工具"
 $py   = "C:\Users\QQQQQ\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe"
 
 if (Test-Path "$dst\微信导出工具.exe") {
-    Copy-Item "$dst\微信导出工具.exe" "$dst\微信导出工具.exe.bak-20261031b" -Force
+    Copy-Item "$dst\微信导出工具.exe" "$dst\微信导出工具.exe.bak-20261101" -Force
 }
 # 直接覆盖（_internal 内容已核对一致，不再整体删除，避免锁文件权限问题）
 Copy-Item "$src\*" $dst -Recurse -Force

@@ -10,7 +10,9 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[('C:/Users/QQQQQ/.dsh/tools/wx-export/vendor', 'vendor'),
-           ('C:/Users/QQQQQ/.dsh/tools/wx-export/app.ico', '.')],
+           ('C:/Users/QQQQQ/.dsh/tools/wx-export/app.ico', '.'),
+           # 微信 4.x 的图片是 wxgf(HEVC) 封装，转成 JPG 必须靠 ffmpeg
+           ('C:/Users/QQQQQ/.dsh/tools/wx-export/ffmpeg.exe', '.')],
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},

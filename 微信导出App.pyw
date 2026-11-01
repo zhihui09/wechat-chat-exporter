@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import queue
 import subprocess
@@ -241,9 +242,13 @@ def _headless_e2e() -> int:
         msgs, me = ex.collect(target["wxid"])
         if not msgs:
             log("E2E FAIL: 该会话无消息"); return 4
-        doc = ex.write_word(msgs, target, me, outdir, "我")
-        tp = ex.write_txt(msgs, target, me, outdir, "我")
-        media = ex.gather_media(msgs, outdir, target_wxid=target["wxid"])
+        safe = re.sub(r'[\\/:*?"<>|]', "_", target["name"])
+        chat_dir = outdir / f"{safe}_聊天记录"
+        doc = ex.write_word(msgs, target, me, chat_dir, "我")
+        tp = ex.write_txt(msgs, target, me, chat_dir, "我")
+        media = ex.gather_media(msgs, chat_dir, target_wxid=target["wxid"])
+        emo = ex.gather_emoticons(chat_dir)
+        media["表情"] = emo["表情"]
         with zipfile.ZipFile(doc) as z:
             xml_ok = "word/document.xml" in z.namelist()
         ex.cleanup()
@@ -628,10 +633,13 @@ class App(tk.Tk):
         r3.pack(fill="x")
         self.do_txt = tk.BooleanVar(value=True)
         self.do_media = tk.BooleanVar(value=False)
+        self.do_emo = tk.BooleanVar(value=False)
         ttk.Checkbutton(r3, text="同时导出 TXT",
                         variable=self.do_txt).pack(side="left")
-        ttk.Checkbutton(r3, text="归集视频 / 文件",
+        ttk.Checkbutton(r3, text="导出图片 / 视频 / 文件",
                         variable=self.do_media).pack(side="left", padx=(14, 0))
+        ttk.Checkbutton(r3, text="导出表情包",
+                        variable=self.do_emo).pack(side="left", padx=(10, 0))
 
         rb = tk.Frame(bo, bg=C_CARD)
         rb.pack(fill="x", pady=(10, 0))
@@ -836,6 +844,15 @@ class App(tk.Tk):
                     size = (f"{doc.stat().st_size / 1024:.0f} KB"
                             if doc.exists() else "")
                     self.result_lbl.configure(text=f"{doc.name} · {size}")
+                    med = v.get("media") or {}
+                    bits = [f"{k} {med[k]}" for k in ("图片", "表情", "视频", "文件")
+                            if med.get(k)]
+                    if med.get("缩略图"):
+                        bits.append(f"低清图 {med['缩略图']}")
+                    if bits:
+                        self._log("媒体：" + " / ".join(bits))
+                        self.result_lbl.configure(
+                            text=f"{doc.name} · {size} · " + " / ".join(bits))
                     self._log(f"完成：{self.last_doc}")
                     self._open()          # 自动打开并选中刚生成的文件
         except queue.Empty:
@@ -1193,10 +1210,13 @@ class App(tk.Tk):
         target = dict(target)
         log(f"开始导出：{target['name']} ({target['wxid']}) "
             f"kind={target['kind']}")
-        outdir = Path(self.out.get())
+        # 每个联系人一个文件夹：文档、TXT、media 全放在自己聊天目录里，不互相混
+        safe = re.sub(r'[\\/:*?"<>|]', "_", target["name"])
+        outdir = Path(self.out.get()) / f"{safe}_聊天记录"
         mynick = "我"
         want_txt = self.do_txt.get()
         want_media = self.do_media.get()
+        want_emo = self.do_emo.get()
 
         self._cancel_evt.clear()
         self._t0 = time.time()
@@ -1226,11 +1246,22 @@ class App(tk.Tk):
                     log(f"write_txt -> {tp}")
                 if want_media:
                     self._t0 = time.time()
-                    self.q.put(("prog", (0, 0, "正在归集视频/文件 ...")))
+                    self.q.put(("prog", (0, 0, "正在解密图片、归集视频/文件 ...")))
                     res["media"] = self.ex.gather_media(
                         msgs, outdir, target_wxid=target["wxid"],
-                        cancel=cancel)
+                        cancel=cancel,
+                        progress=lambda p, m: self.q.put(
+                            ("prog", (int(p), 100, m))))
                     log(f"gather_media -> {res['media']}")
+                if want_emo:
+                    self._t0 = time.time()
+                    self.q.put(("prog", (0, 0, "正在解密表情包 ...")))
+                    emo = self.ex.gather_emoticons(
+                        outdir, cancel=cancel,
+                        progress=lambda p, m: self.q.put(
+                            ("prog", (int(p), 100, m))))
+                    res.setdefault("media", {})["表情"] = emo["表情"]
+                    log(f"gather_emoticons -> {emo}")
                 self.q.put(("done", res))
             except core.ExportCancelled:
                 log("导出被用户取消")
