@@ -755,6 +755,11 @@ class Exporter:
                     if done % 200 == 0 or done == total:
                         progress(done, total,
                                  f"正在读取消息 {done}/{total}")
+                # 先认登录账号自己：一个会话里不止两个 wxid 时（被拉进来的陌生人、
+                # 旧账号 id 等），靠「唯一其它 wxid」会认错，文档里就变成一串裸 wxid。
+                acc = self._account_wxid()
+                if not me and acc and acc in set(smap.values()):
+                    me = acc
                 others = {u for u in smap.values()
                           if u and u != target_wxid and u.startswith("wxid_")}
                 if not me:
