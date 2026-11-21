@@ -244,16 +244,17 @@ def _headless_e2e() -> int:
             log("E2E FAIL: 该会话无消息"); return 4
         safe = re.sub(r'[\\/:*?"<>|]', "_", target["name"])
         chat_dir = outdir / f"{safe}_聊天记录"
+        inline = ex.attach_inline_images(msgs, target["wxid"], dec)
         doc = ex.write_word(msgs, target, me, chat_dir, "我")
         tp = ex.write_txt(msgs, target, me, chat_dir, "我")
-        media = ex.gather_media(msgs, chat_dir, target_wxid=target["wxid"])
         emo = ex.gather_emoticons(chat_dir)
-        media["表情"] = emo["表情"]
         with zipfile.ZipFile(doc) as z:
-            xml_ok = "word/document.xml" in z.namelist()
+            names = z.namelist()
+            xml_ok = "word/document.xml" in names
+            pics = sum(1 for n in names if n.startswith("word/media/"))
         ex.cleanup()
-        log(f"E2E OK msgs={len(msgs)} doc={doc} txt={tp} media={media} "
-            f"docx_xml_ok={xml_ok}")
+        log(f"E2E OK msgs={len(msgs)} doc={doc} txt={tp} inline={inline} "
+            f"emo={emo} docx_pics={pics} docx_xml_ok={xml_ok}")
         return 0 if xml_ok else 5
     except Exception:
         log("E2E FAIL: " + traceback.format_exc())
@@ -632,12 +633,11 @@ class App(tk.Tk):
         r3 = tk.Frame(bo, bg=C_CARD)
         r3.pack(fill="x")
         self.do_txt = tk.BooleanVar(value=True)
-        self.do_media = tk.BooleanVar(value=False)
         self.do_emo = tk.BooleanVar(value=False)
         ttk.Checkbutton(r3, text="同时导出 TXT",
                         variable=self.do_txt).pack(side="left")
-        ttk.Checkbutton(r3, text="导出图片 / 视频 / 文件",
-                        variable=self.do_media).pack(side="left", padx=(14, 0))
+        tk.Label(r3, text="图片会自动嵌进 Word", bg=C_CARD, fg=C_MUTED,
+                 font=tkfont.Font(family=FONT, size=9)).pack(side="left", padx=(14, 0))
         ttk.Checkbutton(r3, text="导出表情包",
                         variable=self.do_emo).pack(side="left", padx=(10, 0))
 
@@ -844,13 +844,20 @@ class App(tk.Tk):
                     size = (f"{doc.stat().st_size / 1024:.0f} KB"
                             if doc.exists() else "")
                     self.result_lbl.configure(text=f"{doc.name} · {size}")
-                    med = v.get("media") or {}
-                    bits = [f"{k} {med[k]}" for k in ("图片", "表情", "视频", "文件")
-                            if med.get(k)]
-                    if med.get("缩略图"):
-                        bits.append(f"低清图 {med['缩略图']}")
+                    inline = v.get("inline") or {}
+                    bits = []
+                    if inline:
+                        n = inline.get("内嵌", 0) + inline.get("缩略图", 0)
+                        if n:
+                            bits.append(f"内嵌图片 {n} 张")
+                        if inline.get("缩略图"):
+                            bits.append(f"其中低清 {inline['缩略图']} 张")
+                        if inline.get("缺失"):
+                            bits.append(f"本机缺图 {inline['缺失']} 张")
+                    if v.get("emo"):
+                        bits.append(f"表情 {v['emo']} 个")
                     if bits:
-                        self._log("媒体：" + " / ".join(bits))
+                        self._log("导出内容：" + " / ".join(bits))
                         self.result_lbl.configure(
                             text=f"{doc.name} · {size} · " + " / ".join(bits))
                     self._log(f"完成：{self.last_doc}")
@@ -1210,12 +1217,11 @@ class App(tk.Tk):
         target = dict(target)
         log(f"开始导出：{target['name']} ({target['wxid']}) "
             f"kind={target['kind']}")
-        # 每个联系人一个文件夹：文档、TXT、media 全放在自己聊天目录里，不互相混
+        # 每个联系人一个文件夹：文档、TXT、表情包全放在自己聊天目录里，不互相混
         safe = re.sub(r'[\\/:*?"<>|]', "_", target["name"])
         outdir = Path(self.out.get()) / f"{safe}_聊天记录"
         mynick = "我"
         want_txt = self.do_txt.get()
-        want_media = self.do_media.get()
         want_emo = self.do_emo.get()
 
         self._cancel_evt.clear()
@@ -1235,24 +1241,29 @@ class App(tk.Tk):
                 if not msgs:
                     raise RuntimeError("这个会话在本机上没有任何消息记录")
                 self._t0 = time.time()
+                self.q.put(("prog", (0, 0, "正在解密图片 ...")))
+                res = {}
+                try:
+                    res["inline"] = self.ex.attach_inline_images(
+                        msgs, target["wxid"], cancel=cancel,
+                        progress=lambda p, m: self.q.put(
+                            ("prog", (int(p), 100, m))))
+                except core.ExportCancelled:
+                    raise
+                except Exception:
+                    # 图片坏了不能连累文字导出
+                    log("图片内嵌失败：" + traceback.format_exc())
+                    res["inline"] = None
+                log(f"attach_inline_images -> {res['inline']}")
                 self.q.put(("prog", (0, 0, "正在写入 Word ...")))
                 doc = self.ex.write_word(msgs, target, me, outdir, mynick,
                                          cancel=cancel)
                 log(f"write_word -> {doc}")
-                res = {"doc": str(doc)}
+                res["doc"] = str(doc)
                 if want_txt:
                     tp = self.ex.write_txt(msgs, target, me, outdir, mynick)
                     res["txt"] = str(tp)
                     log(f"write_txt -> {tp}")
-                if want_media:
-                    self._t0 = time.time()
-                    self.q.put(("prog", (0, 0, "正在解密图片、归集视频/文件 ...")))
-                    res["media"] = self.ex.gather_media(
-                        msgs, outdir, target_wxid=target["wxid"],
-                        cancel=cancel,
-                        progress=lambda p, m: self.q.put(
-                            ("prog", (int(p), 100, m))))
-                    log(f"gather_media -> {res['media']}")
                 if want_emo:
                     self._t0 = time.time()
                     self.q.put(("prog", (0, 0, "正在解密表情包 ...")))
@@ -1260,7 +1271,7 @@ class App(tk.Tk):
                         outdir, cancel=cancel,
                         progress=lambda p, m: self.q.put(
                             ("prog", (int(p), 100, m))))
-                    res.setdefault("media", {})["表情"] = emo["表情"]
+                    res["emo"] = emo["表情"]
                     log(f"gather_emoticons -> {emo}")
                 self.q.put(("done", res))
             except core.ExportCancelled:

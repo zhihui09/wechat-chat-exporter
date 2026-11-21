@@ -6,7 +6,7 @@
   1. 扫描微信数据库目录、从进程内存提取密钥、解密数据库
   2. 列出联系人与群聊
   3. 导出指定会话为 Word / TXT
-  4. 从本地存储归集该会话的图片、视频、文件
+  4. 把图片解密后内嵌进 Word、导出表情包
 """
 from __future__ import annotations
 
@@ -115,11 +115,20 @@ def purge_stale_tmp(max_age_h: float = 0.0) -> int:
 
 
 def write_integrity_manifest(root: Path) -> Path:
-    """给打包目录生成 integrity.json（除自身外全部文件的 sha256）。"""
+    """给打包目录生成 integrity.json（程序自身文件的 sha256）。
+
+    只收根目录下的文件 + 整个 _internal\\：用户往程序目录里放的其它文件夹
+    （截图、导出结果等）不参与校验，否则一改就误报「被改动」。
+    """
     files = {}
-    for p in sorted(root.rglob("*")):
+    targets = [p for p in root.iterdir() if p.is_file()]
+    sub = root / "_internal"
+    if sub.is_dir():
+        targets += list(sub.rglob("*"))
+    for p in sorted(targets):
         # log.txt 是运行时日志，每次启动都会改，不能进清单
-        if p.is_file() and p.name not in ("integrity.json", "log.txt"):
+        if p.is_file() and p.name not in ("integrity.json", "log.txt") \
+                and ".bak" not in p.name:
             rel = str(p.relative_to(root)).replace("\\", "/")
             files[rel] = hashlib.sha256(p.read_bytes()).hexdigest()
     m = root / "integrity.json"
@@ -771,12 +780,30 @@ class Exporter:
         return msgs, me
 
     # ---- 4. 写 Word ----
+    @staticmethod
+    def _add_picture(doc, data: bytes, max_w: float = 4.2, max_h: float = 6.5) -> None:
+        """按比例塞进页面：宽 ≤ max_w 英寸、高 ≤ max_h 英寸。"""
+        from docx.shared import Inches
+        try:
+            import io
+            from PIL import Image
+            with Image.open(io.BytesIO(data)) as im:
+                w, h = im.size
+            win, hin = w / 96.0, h / 96.0
+            k = min(max_w / win, max_h / hin, 1.0) if win and hin else 1.0
+            p = doc.add_paragraph()
+            p.paragraph_format.left_indent = Inches(0.25)
+            p.add_run().add_picture(io.BytesIO(data), width=Inches(win * k))
+        except Exception:
+            self.log("图片嵌入失败：" + traceback.format_exc(limit=1))
+
+
     def write_word(self, msgs: list[dict], target: dict, me_wxid: str,
                    outdir: Path, my_nick: str = "我",
                    rename: dict[str, str] | None = None,
                    cancel: Callable[[], bool] | None = None) -> Path:
         from docx import Document
-        from docx.shared import Pt, RGBColor
+        from docx.shared import Inches, Pt, RGBColor
 
         rename = rename or {}
         if not msgs:
@@ -825,6 +852,9 @@ class Exporter:
             nm.font.color.rgb = color
             bd = p.add_run(norm_content(m["content"], m["type"], rename))
             bd.font.size = Pt(10)
+            img = m.get("img")
+            if img:
+                self._add_picture(doc, img[0])
             if i % 200 == 0:
                 self.progress(i, total, "正在写入 Word ...")
 
@@ -867,20 +897,10 @@ class Exporter:
         cand = self.db_dir.parent / "msg"
         return cand if cand.is_dir() else None
 
-    # ---- 5. 媒体文件归集 ----
+    # ---- 5. 图片 ----
     # 微信 4.x 真实布局（本机实测）：
-    #   msg/attach/<32位会话哈希>/<YYYY-MM>/Img/*.dat     图片（AES 加密）
-    #   msg/attach/<32位会话哈希>/<YYYY-MM>/Video/*       视频
-    #   msg/attach/<32位会话哈希>/<YYYY-MM>/Thumb/*       缩略图
-    #   msg/file/<YYYY-MM>/<原文件名>                     收到的文件（明文）
-    #   msg/video/<YYYY-MM>/*                             视频
+    #   msg/attach/<32位会话哈希>/<YYYY-MM>/Img/*.dat     图片（AES 加密），*_t.dat 是缩略图
     # 注意：attach 下**没有**按月顶层目录，月份在哈希目录内部。
-    MEDIA_KINDS = {
-        "图片": ("attach", None, ("Img",), (".dat",)),
-        "视频": ("video", None, None, (".mp4", ".mov", ".mkv", ".avi")),
-        "文件": ("file", None, None, None),
-    }
-
     def _session_hash(self, wxid: str) -> str:
         return hashlib.md5(wxid.encode()).hexdigest()
 
@@ -1158,126 +1178,189 @@ class Exporter:
             shutil.rmtree(tmpd, ignore_errors=True)
         return None
 
-    def _gather_images(self, attach_root: Path, wxid: str, months: set[str],
-                       outdir: Path, limit: int,
-                       progress: Callable[[float, str], None] | None,
-                       cancel: Callable[[], bool] | None) -> dict:
-        """按「会话哈希 + 月份」解出该会话的图片。
+    # ---- 5.2 图片内嵌：把 type=3 消息对应到本机 .dat 并解出图片 ----
+    # 对应关系（本机实测 2026-11-21）：
+    #   消息 XML 的 md5 = 解密后文件的 md5；hardlink.db 的 image_hardlink_info_v4
+    #   正好记着 md5 -> 本地文件名（文件名本身 ≠ md5，别直接按名字找）。
+    # 只有缩略图留在本机时，用「文件字节数 = cdnthumblength + 31」兜底匹配。
+    THUMB_OVERHEAD = 31
 
-        原图解不出（wxgf 且没有 ffmpeg）时退回同名缩略图，保证每一张都有东西看。
-        """
-        stats = {"图片": 0, "缩略图": 0, "跳过": 0}
-        direct = attach_root / "attach" / self._session_hash(wxid) / "Img"
-        # 兼容「月份目录在会话哈希下」和「会话哈希在月份下」两种布局
-        if not direct.is_dir():
-            alt = attach_root / "attach" / self._session_hash(wxid)
-            if alt.is_dir():
-                direct = alt
+    def _image_hardlink_map(self, dec: Path) -> dict[str, str]:
+        p = dec / "hardlink" / "hardlink.db"
+        out: dict[str, str] = {}
+        if not p.exists():
+            return out
+        try:
+            con = open_db(p)
+        except sqlite3.Error:
+            return out
+        try:
+            for md5v, fn in con.execute(
+                    "SELECT md5, file_name FROM image_hardlink_info_v4"):
+                if md5v and fn:
+                    out[str(md5v).lower()] = str(fn)
+        except sqlite3.Error:
+            pass
+        finally:
+            con.close()
+        return out
+
+    def _chat_image_files(self, attach_root: Path, wxid: str):
+        """返回 (原图 {stem: Path}, 缩略图 {stem: Path})。"""
+        base = attach_root / "attach" / self._session_hash(wxid)
+        full: dict[str, Path] = {}
+        thumb: dict[str, Path] = {}
+        if not base.is_dir():
+            return full, thumb
+        for p in base.rglob("*.dat"):
+            if p.parent.name != "Img":
+                continue
+            if p.stem.endswith("_t"):
+                thumb[p.stem[:-2]] = p
             else:
-                self.log(f"没找到该会话的图片目录：{direct}")
-                return stats
+                full[p.stem] = p
+        return full, thumb
 
-        files: list[Path] = []
-        for month in sorted(months):
-            d = direct / month / "Img"
-            if not d.is_dir():
-                d = direct / "Img" / month
-            if d.is_dir():
-                files += [p for p in d.glob("*.dat") if not p.name.endswith("_t.dat")]
-        if not files:
-            self.log("该会话这些月份里没有图片")
+    @staticmethod
+    def _img_xml(content) -> str:
+        if isinstance(content, bytes) and content[:4] == bytes.fromhex("28b52ffd"):
+            return _zstd(content) or ""
+        return content.decode("utf-8", "replace") if isinstance(content, bytes) else (content or "")
+
+    @classmethod
+    def _img_msg_md5(cls, content) -> tuple[str, str]:
+        """消息里 md5（本地文件）、originsourcemd5（原图）两个值。"""
+        s = cls._img_xml(content)
+        a = re.search(r'\bmd5="([0-9a-fA-F]{32})"', s)
+        b = re.search(r'originsourcemd5="([0-9a-fA-F]{32})"', s)
+        return (a.group(1).lower() if a else "", b.group(1).lower() if b else "")
+
+    @classmethod
+    def _img_thumb_len(cls, content) -> int:
+        m = re.search(r'cdnthumblength="(\d+)"', cls._img_xml(content))
+        return int(m.group(1)) if m else 0
+
+    def _decode_image_file(self, p: Path, xor_key: int, aes_key: str):
+        try:
+            raw = p.read_bytes()
+        except OSError:
+            return None, None
+        data = self.decrypt_dat(raw, xor_key, aes_key)
+        if not data:
+            return None, None
+        if data[:4] == b"wxgf":
+            hit = self._find_image_magic(data)
+            if hit:
+                return data[hit[0]:], hit[1]
+            jpg = self.wxgf_to_jpg(data)
+            return (jpg, ".jpg") if jpg else (None, None)
+        ext = (".jpg" if data[:3] == b"\xff\xd8\xff" else
+               ".png" if data[:8] == b"\x89PNG\r\n\x1a\n" else
+               ".gif" if data[:4] == b"GIF8" else
+               ".webp" if data[:4] == b"RIFF" and data[8:12] == b"WEBP" else None)
+        return (data, ext) if ext else (None, None)
+
+    @staticmethod
+    def _shrink_image(data: bytes, max_px: int = 1600) -> bytes | None:
+        """压成 JPEG，控制 Word 体积；压不了就返回 None 用原图。"""
+        try:
+            import io
+            from PIL import Image
+            im = Image.open(io.BytesIO(data))
+            im.load()
+            if im.mode in ("RGBA", "LA", "P"):
+                rgba = im.convert("RGBA")
+                bg = Image.new("RGB", rgba.size, (255, 255, 255))
+                bg.paste(rgba, mask=rgba.split()[-1])
+                im = bg
+            elif im.mode != "RGB":
+                im = im.convert("RGB")
+            w, h = im.size
+            if max(w, h) > max_px:
+                r = max_px / float(max(w, h))
+                im = im.resize((max(1, int(w * r)), max(1, int(h * r))),
+                               Image.LANCZOS)
+            buf = io.BytesIO()
+            im.save(buf, "JPEG", quality=85, optimize=True)
+            return buf.getvalue()
+        except Exception:
+            return None
+
+    def attach_inline_images(self, msgs: list[dict], target_wxid: str,
+                             dec: Path | None = None,
+                             progress: Callable[[float, str], None] | None = None,
+                             cancel: Callable[[], bool] | None = None) -> dict:
+        """给每条 type=3 消息挂上 m["img"] = (图片字节, 扩展名)，供 Word 内嵌。"""
+        dec = dec or self.dec_dir
+        stats = {"内嵌": 0, "缩略图": 0, "缺失": 0, "跳过": 0}
+        imgs = [m for m in msgs if m.get("type") == 3]
+        if not imgs:
             return stats
-
-        account = self._account_wxid() or wxid
-        key = self.derive_image_key(account, direct if direct.name == "Img" else direct.parent,
+        root = self._find_attach_root()
+        if not root or not dec:
+            stats["缺失"] = len(imgs)
+            return stats
+        full, thumb = self._chat_image_files(root, target_wxid)
+        if not full and not thumb:
+            self.log("图片：这个会话在本机没有图片文件")
+            stats["缺失"] = len(imgs)
+            return stats
+        account = self._account_wxid() or target_wxid
+        key = self.derive_image_key(account, root / "attach",
                                     progress=progress, cancel=cancel)
         if not key:
-            stats["跳过"] = len(files)
+            stats["缺失"] = len(imgs)
             return stats
         xor_key, aes_key, _uin = key
-        total = len(files)
-        self.log(f"图片 {total} 张，开始解密（ffmpeg={'有' if self.find_ffmpeg() else '无'}）")
-
-        dst = outdir / "media" / "图片"
-        dst.mkdir(parents=True, exist_ok=True)
-        thumb_dir = dst / "缩略图"
-        lock = threading.Lock()
-        done = [0]
-
-        def one(p: Path) -> None:
+        hl = self._image_hardlink_map(dec)
+        by_size: dict[int, list[Path]] = {}
+        for p in thumb.values():
+            try:
+                by_size.setdefault(p.stat().st_size, []).append(p)
+            except OSError:
+                continue
+        used: set[Path] = set()
+        total = len(imgs)
+        self.log(f"图片消息 {total} 条，本机原图 {len(full)} 张、缩略图 {len(thumb)} 张")
+        for i, m in enumerate(imgs, 1):
             if cancel and cancel():
                 raise ExportCancelled("已取消")
-            got = False
-            try:
-                raw = p.read_bytes()
-            except OSError:
-                raw = None
-            data = self.decrypt_dat(raw, xor_key, aes_key) if raw else None
-            ext = None
-            if data:
-                if data[:4] == b"wxgf":
-                    hit = self._find_image_magic(data)
-                    if hit:
-                        data = data[hit[0]:]
-                        ext = hit[1]
-                    else:
-                        jpg = self.wxgf_to_jpg(data)
-                        if jpg:
-                            data, ext = jpg, ".jpg"
-                elif self._img_magic_ok(data):
-                    ext = (".jpg" if data[:3] == b"\xff\xd8\xff" else
-                           ".png" if data[:8] == b"\x89PNG\r\n\x1a\n" else
-                           ".gif" if data[:4] == b"GIF8" else
-                           ".webp" if data[:4] == b"RIFF" else None)
-            if ext and data:
-                try:
-                    (dst / f"{p.stem}{ext}").write_bytes(data)
-                    with lock:
-                        stats["图片"] += 1
-                    return
-                except OSError:
-                    pass
-            # 原图解不出来，就用同名缩略图兜底
-            thumb = p.with_name(p.stem + "_t.dat")
-            if thumb.is_file():
-                try:
-                    t = self.decrypt_dat(thumb.read_bytes(), xor_key, aes_key)
-                except OSError:
-                    t = None
-                if t and self._img_magic_ok(t):
-                    text = (".jpg" if t[:3] == b"\xff\xd8\xff" else
-                            ".png" if t[:8] == b"\x89PNG\r\n\x1a\n" else None)
-                    if text:
-                        thumb_dir.mkdir(parents=True, exist_ok=True)
-                        (thumb_dir / f"{p.stem}{text}").write_bytes(t)
-                        with lock:
-                            stats["缩略图"] += 1
-                        got = True
-            if not got:
-                with lock:
-                    stats["跳过"] += 1
-
-        workers = min(8, max(2, (os.cpu_count() or 4)))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            futs = {pool.submit(one, p): p for p in files}
-            for fut in concurrent.futures.as_completed(futs):
-                done[0] += 1
-                if progress and (done[0] % 10 == 0 or done[0] == total):
-                    progress(done[0] * 100.0 / total,
-                             f"正在解密图片 {done[0]}/{total}")
-                if cancel and cancel():
-                    for f in futs:
-                        f.cancel()
-                    raise ExportCancelled("已取消")
-                try:
-                    fut.result()
-                except ExportCancelled:
-                    raise
-                except Exception:
-                    with lock:
-                        stats["跳过"] += 1
-        self.log(f"  图片：{stats['图片']} 张原图、{stats['缩略图']} 张缩略图、"
-                 f"{stats['跳过']} 张解不开")
+            if progress and (i % 5 == 0 or i == total):
+                progress(i * 100.0 / total, f"正在解密图片 {i}/{total}")
+            md5v, osmd5 = self._img_msg_md5(m.get("content"))
+            path = None
+            for v in (md5v, osmd5):
+                fn = hl.get(v) if v else None
+                if fn:
+                    stem = fn[:-4] if fn.lower().endswith(".dat") else fn
+                    hit = full.get(stem)
+                    if hit is not None and hit not in used:
+                        path = hit
+                        break
+            if path is None:
+                n = self._img_thumb_len(m.get("content"))
+                cands = [p for p in by_size.get(n + self.THUMB_OVERHEAD, [])
+                         if p not in used] if n else []
+                if cands:
+                    t = m.get("time") or 0
+                    cands.sort(key=lambda p: abs(p.stat().st_mtime - t))
+                    path = cands[0]
+            if path is None:
+                stats["缺失"] += 1
+                continue
+            used.add(path)
+            data, ext = self._decode_image_file(path, xor_key, aes_key)
+            if not data:
+                stats["跳过"] += 1
+                continue
+            if ext != ".gif" or len(data) > 300_000:
+                shr = self._shrink_image(data)
+                if shr:
+                    data, ext = shr, ".jpg"
+            m["img"] = (data, ext)
+            stats["缩略图" if path.name.endswith("_t.dat") else "内嵌"] += 1
+        self.log(f"  图片：内嵌 {stats['内嵌']} 张、用缩略图 {stats['缩略图']} 张、"
+                 f"本机没有 {stats['缺失']} 张、解不开 {stats['跳过']} 张")
         return stats
 
     # ---- 表情包（账号级，AES-128-CBC key=IV）----
@@ -1469,7 +1552,7 @@ class Exporter:
     def gather_emoticons(self, outdir: Path,
                          cancel: Callable[[], bool] | None = None,
                          progress: Callable[[float, str], None] | None = None) -> dict:
-        """把本账号的表情包解密导出到 media/表情包/，按包名 + 图注命名。"""
+        """把本账号的表情包解密导出到 表情包/，按包名 + 图注命名。"""
         stats = {"表情": 0, "跳过": 0}
         if not self.db_dir:
             return stats
@@ -1526,7 +1609,7 @@ class Exporter:
                 files.setdefault(md5, data)
 
         meta = self._emo_db_meta()
-        dst_root = outdir / "media" / "表情包"
+        dst_root = outdir / "表情包"
         clean = lambda s: (re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", str(s)).strip()
                            or "未命名")
         for md5, data in files.items():
@@ -1558,78 +1641,6 @@ class Exporter:
             except OSError:
                 stats["跳过"] += 1
         self.log(f"  表情包：{stats['表情']} 个（{stats['跳过']} 个解不开）")
-        return stats
-
-    def gather_media(self, msgs: list[dict], outdir: Path,
-                     target_wxid: str = "", limit: int = 5000,
-                     cancel: Callable[[], bool] | None = None,
-                     progress: Callable[[float, str], None] | None = None) -> dict:
-        """把该会话的图片/视频/文件复制到 outdir/media，并按类型分好。
-
-        只按「会话哈希 + 月份」定位，不做逐条消息对齐；不改动任何原文件。
-        """
-        root = self._find_attach_root()
-        stats = {"图片": 0, "视频": 0, "文件": 0, "语音": 0}
-        if not root:
-            self.log("找不到附件目录（msg/），跳过媒体归集")
-            return stats
-
-        stamps = {int(m["time"]) for m in msgs if m.get("time")}
-        months = {datetime.datetime.fromtimestamp(s).strftime("%Y-%m")
-                  for s in stamps}
-        if not months:
-            self.log("消息里没有时间戳，跳过媒体归集")
-            return stats
-        self.log(f"涉及 {len(months)} 个月份，在 {root} 下归集附件")
-
-        if target_wxid:
-            try:
-                img = self._gather_images(root, target_wxid, months, outdir,
-                                          limit, progress, cancel)
-                stats["图片"] = img["图片"]
-                stats["缩略图"] = img["缩略图"]
-            except ExportCancelled:
-                raise
-            except Exception:
-                self.log("图片归集失败：\n" + traceback.format_exc())
-
-        want = {k: outdir / "media" / k for k in ("视频", "文件")}
-        for d in want.values():
-            d.mkdir(parents=True, exist_ok=True)
-
-        # 图片（msg/attach/<hash>/<month>/Img/*.dat）暂不处理：
-        # 4.x 的 .dat 是 wxgf 封装 + AES，需要另一套密钥，归集出来也打不开。
-
-        # ---- 视频 / 文件：按月顶层目录 ----
-        for kind, subdir, _unused, exts in (
-                ("视频", "video", None, (".mp4", ".mov", ".mkv", ".avi")),
-                ("文件", "file", None, None)):
-            base = root / subdir
-            if not base.is_dir():
-                continue
-            for month in months:
-                md = base / month
-                if not md.is_dir():
-                    continue
-                for f in md.rglob("*"):
-                    if cancel and cancel():
-                        raise ExportCancelled("已取消")
-                    if stats[kind] >= limit:
-                        break
-                    if not f.is_file():
-                        continue
-                    if exts and f.suffix.lower() not in exts:
-                        continue
-                    dst = want[kind] / f.name
-                    if dst.exists():
-                        dst = want[kind] / f"{f.parent.name}_{f.name}"
-                    try:
-                        shutil.copyfile(f, dst)   # copyfile 不继承只读属性
-                        stats[kind] += 1
-                    except (OSError, PermissionError):
-                        continue
-            self.log(f"  {kind}：{stats[kind]} 个")
-
         return stats
 
     def cleanup(self):

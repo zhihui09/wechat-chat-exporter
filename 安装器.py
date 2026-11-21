@@ -111,9 +111,35 @@ def write_uninstaller(target: Path) -> None:
         encoding="utf-8")
 
 
+def write_manifest(target: Path) -> None:
+    """装完补一份 integrity.json：主程序启动时会拿它校验程序文件有没有缺/被改。
+
+    规则与 wxexport_core.write_integrity_manifest 保持一致：只收根目录文件 +
+    _internal\\ 下的全部文件；日志和备份不参与。
+    """
+    import hashlib
+    import json
+    files = {}
+    targets = [p for p in target.iterdir() if p.is_file()]
+    sub = target / "_internal"
+    if sub.is_dir():
+        targets += list(sub.rglob("*"))
+    for p in sorted(targets):
+        if not p.is_file():
+            continue
+        if p.name in ("integrity.json", "log.txt") or ".bak" in p.name:
+            continue
+        rel = str(p.relative_to(target)).replace("\\", "/")
+        files[rel] = hashlib.sha256(p.read_bytes()).hexdigest()
+    (target / "integrity.json").write_text(
+        json.dumps({"sha256": files}, ensure_ascii=False), encoding="utf-8")
+
+
 def install(target: Path, progress=lambda pct, msg: None) -> None:
     progress(1, "正在解压程序文件 ...")
     extract_payload(target, progress)
+    progress(95, "正在生成完整性清单 ...")
+    write_manifest(target)
     exe = target / EXE_NAME
     if not exe.exists():
         raise RuntimeError("解压后没找到主程序，安装包可能不完整。")
