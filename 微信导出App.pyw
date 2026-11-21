@@ -216,14 +216,22 @@ def _headless_e2e() -> int:
     import zipfile
     args = Path(sys.executable).parent / "e2e_args.txt"
     kw, outdir = "", Path.home() / "Documents" / "微信导出" / "e2e"
+    opts: dict[str, str] = {}
     try:
         lines = args.read_text(encoding="utf-8").splitlines()
         if lines:
             kw = lines[0].strip()
         if len(lines) > 1 and lines[1].strip():
             outdir = Path(lines[1].strip())
+        if len(lines) > 2:
+            for tok in lines[2].replace("；", ";").split(";"):
+                if "=" in tok:
+                    k, v = tok.split("=", 1)
+                    opts[k.strip()] = v.strip()
     except OSError:
         pass
+    want_img = opts.get("img", "1") != "0"
+    want_stk = opts.get("stk", "1") != "0"
     log(f"E2E 开始 kw={kw!r} out={outdir}")
     if not core.is_admin():
         log("E2E FAIL: 非管理员"); return 2
@@ -242,9 +250,23 @@ def _headless_e2e() -> int:
         msgs, me = ex.collect(target["wxid"])
         if not msgs:
             log("E2E FAIL: 该会话无消息"); return 4
+        if opts.get("from") or opts.get("to"):
+            def _day(s):
+                y, m, d = re.split(r"[-/.]", s)
+                return datetime(int(y), int(m), int(d)).timestamp()
+            f = _day(opts["from"]) if opts.get("from") else None
+            t = _day(opts["to"]) + 86399 if opts.get("to") else None
+            n_all = len(msgs)
+            msgs = [m for m in msgs
+                    if (f is None or (m.get("time") or 0) >= f)
+                    and (t is None or (m.get("time") or 0) <= t)]
+            log(f"E2E 日期筛选 {n_all} -> {len(msgs)}")
+            if not msgs:
+                log("E2E FAIL: 日期筛选后没有消息"); return 6
         safe = re.sub(r'[\\/:*?"<>|]', "_", target["name"])
         chat_dir = outdir / f"{safe}_聊天记录"
-        inline = ex.attach_inline_images(msgs, target["wxid"], dec)
+        inline = ex.attach_inline_images(msgs, target["wxid"], dec) if want_img else {}
+        stk = ex.attach_inline_stickers(msgs) if want_stk else {}
         doc = ex.write_word(msgs, target, me, chat_dir, "我")
         tp = ex.write_txt(msgs, target, me, chat_dir, "我")
         emo = ex.gather_emoticons(chat_dir)
@@ -254,7 +276,7 @@ def _headless_e2e() -> int:
             pics = sum(1 for n in names if n.startswith("word/media/"))
         ex.cleanup()
         log(f"E2E OK msgs={len(msgs)} doc={doc} txt={tp} inline={inline} "
-            f"emo={emo} docx_pics={pics} docx_xml_ok={xml_ok}")
+            f"stk={stk} emo={emo} docx_pics={pics} docx_xml_ok={xml_ok}")
         return 0 if xml_ok else 5
     except Exception:
         log("E2E FAIL: " + traceback.format_exc())
@@ -438,7 +460,7 @@ class App(tk.Tk):
         super().__init__()
         self.title(APP)
         _apply_icon(self)
-        self.geometry("1120x800")
+        self.geometry("1280x780")
         self.minsize(1000, 660)
         self.configure(bg=C_BG)
 
@@ -611,7 +633,7 @@ class App(tk.Tk):
         self.lbl_state.pack(fill="x", pady=(2, 0))
 
         # 选项 + 主按钮
-        co = Card(right, padding=14, fixed=196)
+        co = Card(right, padding=14, fixed=280)
         co.pack(fill="x", pady=(0, 10))
         bo = co.body
         bo.configure(bg=C_CARD)
@@ -630,16 +652,47 @@ class App(tk.Tk):
                                       fg=C_TEXT, hover="#E2DFD8", sub=True)
         self.btn_browse.pack(side="left", padx=(8, 0))
 
+        # 时间范围（留空 = 不限）
         r3 = tk.Frame(bo, bg=C_CARD)
         r3.pack(fill="x")
+        tk.Label(r3, text="时间范围", bg=C_CARD, fg=C_SUB,
+                 font=(FONT, 9)).pack(side="left")
+        ent_kw = dict(relief="flat", bg="#F5F4F0", fg=C_TEXT, font=(FONT, 9),
+                      insertbackground=C_TEXT, highlightthickness=1,
+                      highlightbackground=C_LINE, highlightcolor=C_ACCENT,
+                      width=10)
+        self.d_from = tk.StringVar()
+        self.d_to = tk.StringVar()
+        tk.Entry(r3, textvariable=self.d_from, **ent_kw).pack(
+            side="left", padx=(8, 0), ipady=4)
+        tk.Label(r3, text="到", bg=C_CARD, fg=C_SUB,
+                 font=(FONT, 9)).pack(side="left", padx=4)
+        tk.Entry(r3, textvariable=self.d_to, **ent_kw).pack(side="left", ipady=4)
+        tk.Button(r3, text="全部", command=self._clear_dates, relief="flat",
+                  bg="#EDEBE5", fg=C_TEXT, font=(FONT, 9), bd=0, padx=8, pady=2,
+                  activebackground="#E2DFD8", cursor="hand2").pack(
+            side="left", padx=(6, 0))
+        tk.Label(bo, text="日期写成 2026-10-01，留空 = 不限", bg=C_CARD,
+                 fg=C_MUTED, font=(FONT, 8), anchor="w").pack(
+            fill="x", pady=(2, 0))
+
+        # 内嵌内容 + 附加产物
+        self.do_img = tk.BooleanVar(value=True)
+        self.do_stk = tk.BooleanVar(value=True)
+        r3b = tk.Frame(bo, bg=C_CARD)
+        r3b.pack(fill="x", pady=(6, 0))
+        ttk.Checkbutton(r3b, text="内嵌图片",
+                        variable=self.do_img).pack(side="left")
+        ttk.Checkbutton(r3b, text="内嵌表情",
+                        variable=self.do_stk).pack(side="left", padx=(12, 0))
         self.do_txt = tk.BooleanVar(value=True)
         self.do_emo = tk.BooleanVar(value=False)
-        ttk.Checkbutton(r3, text="同时导出 TXT",
+        r3c = tk.Frame(bo, bg=C_CARD)
+        r3c.pack(fill="x")
+        ttk.Checkbutton(r3c, text="同时导出 TXT",
                         variable=self.do_txt).pack(side="left")
-        tk.Label(r3, text="图片会自动嵌进 Word", bg=C_CARD, fg=C_MUTED,
-                 font=tkfont.Font(family=FONT, size=9)).pack(side="left", padx=(14, 0))
-        ttk.Checkbutton(r3, text="导出表情包",
-                        variable=self.do_emo).pack(side="left", padx=(10, 0))
+        ttk.Checkbutton(r3c, text="导出表情包",
+                        variable=self.do_emo).pack(side="left", padx=(12, 0))
 
         rb = tk.Frame(bo, bg=C_CARD)
         rb.pack(fill="x", pady=(10, 0))
@@ -764,6 +817,35 @@ class App(tk.Tk):
         if d:
             self.out.set(d)
 
+    def _clear_dates(self):
+        self.d_from.set("")
+        self.d_to.set("")
+
+    def _date_range(self):
+        """读界面上的日期框 → (起始时间戳, 结束时间戳)，留空的一端为 None。
+
+        支持 2026-10-01 / 2026/10/1 / 20261001；结束日期含当天 23:59:59。
+        """
+        vals = []
+        for var, label in ((self.d_from, "开始日期"), (self.d_to, "结束日期")):
+            s = var.get().strip()
+            if not s:
+                vals.append(None)
+                continue
+            m = re.fullmatch(r"(\d{4})[-/.年]?(\d{1,2})[-/.月]?(\d{1,2})日?", s)
+            if not m:
+                raise ValueError(f"{label}格式不对，写成 2026-10-01 这样（留空 = 不限）")
+            try:
+                vals.append(datetime(*map(int, m.groups())))
+            except ValueError:
+                raise ValueError(f"{label}不是有效日期：{s}")
+        start, end = vals
+        if start and end and start > end:
+            raise ValueError("开始日期比结束日期还晚，调一下")
+        start_ts = start.timestamp() if start else None
+        end_ts = end.timestamp() + 86399 if end else None
+        return start_ts, end_ts
+
     def _open_log(self):
         if LOG_PATH and Path(LOG_PATH).exists():
             try:
@@ -845,7 +927,10 @@ class App(tk.Tk):
                             if doc.exists() else "")
                     self.result_lbl.configure(text=f"{doc.name} · {size}")
                     inline = v.get("inline") or {}
+                    stk = v.get("stk") or {}
                     bits = []
+                    if v.get("n"):
+                        bits.append(f"共 {v['n']} 条")
                     if inline:
                         n = inline.get("内嵌", 0) + inline.get("缩略图", 0)
                         if n:
@@ -854,6 +939,10 @@ class App(tk.Tk):
                             bits.append(f"其中低清 {inline['缩略图']} 张")
                         if inline.get("缺失"):
                             bits.append(f"本机缺图 {inline['缺失']} 张")
+                    if stk.get("内嵌"):
+                        bits.append(f"内嵌表情 {stk['内嵌']} 条")
+                    if stk.get("缺失"):
+                        bits.append(f"表情本机缺 {stk['缺失']} 条")
                     if v.get("emo"):
                         bits.append(f"表情 {v['emo']} 个")
                     if bits:
@@ -1223,6 +1312,13 @@ class App(tk.Tk):
         mynick = "我"
         want_txt = self.do_txt.get()
         want_emo = self.do_emo.get()
+        want_img = self.do_img.get()
+        want_stk = self.do_stk.get()
+        try:
+            d_start, d_end = self._date_range()
+        except ValueError as e:
+            messagebox.showinfo(APP, str(e))
+            return
 
         self._cancel_evt.clear()
         self._t0 = time.time()
@@ -1240,21 +1336,45 @@ class App(tk.Tk):
                 log(f"collect -> {len(msgs)} 条消息")
                 if not msgs:
                     raise RuntimeError("这个会话在本机上没有任何消息记录")
-                self._t0 = time.time()
-                self.q.put(("prog", (0, 0, "正在解密图片 ...")))
                 res = {}
-                try:
-                    res["inline"] = self.ex.attach_inline_images(
-                        msgs, target["wxid"], cancel=cancel,
-                        progress=lambda p, m: self.q.put(
-                            ("prog", (int(p), 100, m))))
-                except core.ExportCancelled:
-                    raise
-                except Exception:
-                    # 图片坏了不能连累文字导出
-                    log("图片内嵌失败：" + traceback.format_exc())
-                    res["inline"] = None
-                log(f"attach_inline_images -> {res['inline']}")
+                if d_start is not None or d_end is not None:
+                    n_all = len(msgs)
+                    msgs = [m for m in msgs
+                            if (d_start is None or (m.get("time") or 0) >= d_start)
+                            and (d_end is None or (m.get("time") or 0) <= d_end)]
+                    log(f"日期筛选 -> {len(msgs)}/{n_all}")
+                    if not msgs:
+                        raise RuntimeError(
+                            "这个时间段里没有聊天记录，把日期改宽一点再试")
+                res["n"] = len(msgs)
+                self._t0 = time.time()
+                if want_img:
+                    self.q.put(("prog", (0, 0, "正在解密图片 ...")))
+                    try:
+                        res["inline"] = self.ex.attach_inline_images(
+                            msgs, target["wxid"], cancel=cancel,
+                            progress=lambda p, m: self.q.put(
+                                ("prog", (int(p), 100, m))))
+                    except core.ExportCancelled:
+                        raise
+                    except Exception:
+                        # 图片坏了不能连累文字导出
+                        log("图片内嵌失败：" + traceback.format_exc())
+                        res["inline"] = None
+                    log(f"attach_inline_images -> {res['inline']}")
+                if want_stk:
+                    self.q.put(("prog", (0, 0, "正在内嵌表情 ...")))
+                    try:
+                        res["stk"] = self.ex.attach_inline_stickers(
+                            msgs, cancel=cancel,
+                            progress=lambda p, m: self.q.put(
+                                ("prog", (int(p), 100, m))))
+                    except core.ExportCancelled:
+                        raise
+                    except Exception:
+                        log("表情内嵌失败：" + traceback.format_exc())
+                        res["stk"] = None
+                    log(f"attach_inline_stickers -> {res['stk']}")
                 self.q.put(("prog", (0, 0, "正在写入 Word ...")))
                 doc = self.ex.write_word(msgs, target, me, outdir, mynick,
                                          cancel=cancel)

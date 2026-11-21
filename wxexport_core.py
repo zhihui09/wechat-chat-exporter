@@ -785,8 +785,8 @@ class Exporter:
         return msgs, me
 
     # ---- 4. 写 Word ----
-    @staticmethod
-    def _add_picture(doc, data: bytes, max_w: float = 4.2, max_h: float = 6.5) -> None:
+    def _add_picture(self, doc, data: bytes, max_w: float = 4.2,
+                     max_h: float = 6.5) -> None:
         """按比例塞进页面：宽 ≤ max_w 英寸、高 ≤ max_h 英寸。"""
         from docx.shared import Inches
         try:
@@ -855,11 +855,16 @@ class Exporter:
             nm.bold = True
             nm.font.size = Pt(9)
             nm.font.color.rgb = color
-            bd = p.add_run(norm_content(m["content"], m["type"], rename))
-            bd.font.size = Pt(10)
             img = m.get("img")
+            sticker = bool(img) and m.get("img_kind") == "sticker"
+            if not sticker:      # 表情已经画出来了，就不再写一行「[表情]」
+                bd = p.add_run(norm_content(m["content"], m["type"], rename))
+                bd.font.size = Pt(10)
             if img:
-                self._add_picture(doc, img[0])
+                if sticker:
+                    self._add_picture(doc, img[0], max_w=1.5, max_h=1.5)
+                else:
+                    self._add_picture(doc, img[0])
             if i % 200 == 0:
                 self.progress(i, total, "正在写入 Word ...")
 
@@ -1366,6 +1371,158 @@ class Exporter:
             stats["缩略图" if path.name.endswith("_t.dat") else "内嵌"] += 1
         self.log(f"  图片：内嵌 {stats['内嵌']} 张、用缩略图 {stats['缩略图']} 张、"
                  f"本机没有 {stats['缺失']} 张、解不开 {stats['跳过']} 张")
+        return stats
+
+    # ---- 表情消息（type=47）：直接内嵌到 Word ----
+    STICKER_MAX_PX = 320
+
+    @classmethod
+    def _sticker_md5(cls, content) -> str:
+        """表情消息 XML 里的 md5（= 本机表情文件的内容 md5）。"""
+        s = cls._img_xml(content)
+        m = re.search(r'<emoji\b[^>]*\bmd5="([0-9a-fA-F]{32})"', s)
+        if not m:
+            m = re.search(r'\bmd5="([0-9a-fA-F]{32})"', s)
+        return m.group(1).lower() if m else ""
+
+    def _emoticon_uin(self) -> int | None:
+        """表情密钥的 seed（= 图片用的 uin）；图片没解过就读缓存的。"""
+        if self.image_uin is not None:
+            return self.image_uin
+        acc = self._account_wxid()
+        if not acc:
+            return None
+        c = self._load_cached_image_key(acc)
+        return c[2] if c else None
+
+    def _scan_sticker_blobs(self, want: set[str], key: bytes,
+                            progress: Callable[[float, str], None] | None = None,
+                            cancel: Callable[[], bool] | None = None) -> dict[str, bytes]:
+        """在 business/emoticon 与 cache\\<月>\\Emoticon 里捞出这批 md5 的表情。
+
+        只解密文件名/容器分片命中 want 的，不全量解密；缩略图只在没原图时兜底。
+        """
+        body: dict[str, bytes] = {}
+        thumb: dict[str, bytes] = {}
+        if not self.db_dir:
+            return body
+        acc_root = self.db_dir.parent
+        emo_dir = acc_root / "business" / "emoticon"
+        pat = re.compile(r"^([0-9a-f]{32})(?:\.thumb)?$")
+        cands: list[tuple[Path, bool, bool]] = []   # (路径, 是否缩略, 是否容器)
+        for sub in ("Persist", "PersistStore", "Thumb", "ThumbStore"):
+            d = emo_dir / sub
+            if not d.is_dir():
+                continue
+            for p in d.rglob("*"):
+                m = pat.match(p.name)
+                if p.is_file() and m and m.group(1) in want:
+                    cands.append((p, sub.startswith("Thumb"), sub == "PersistStore"))
+        cache = acc_root / "cache"
+        if cache.is_dir():
+            for p in cache.rglob("Emoticon/*/*"):
+                m = pat.match(p.name)
+                if p.is_file() and m and m.group(1) in want:
+                    cands.append((p, False, False))
+        total = len(cands) or 1
+        for i, (p, is_thumb, is_container) in enumerate(cands, 1):
+            if cancel and cancel():
+                raise ExportCancelled("已取消")
+            if progress and (i % 10 == 0 or i == total):
+                progress(i * 100.0 / total, f"正在解密表情 {i}/{total}")
+            data = self._decrypt_emo_file(p, key)
+            if not data:
+                continue
+            tgt = thumb if is_thumb else body
+            if is_container:
+                for part in self._split_emo_container(data):
+                    h = hashlib.md5(part).hexdigest()
+                    if h in want:
+                        tgt.setdefault(h, part)
+            else:
+                tgt.setdefault(pat.match(p.name).group(1), data)
+        for k, v in thumb.items():
+            body.setdefault(k, v)
+        return body
+
+    def _sticker_image(self, data: bytes):
+        """表情文件 → (字节, 扩展名)；wxgf 转 JPG，大图/大 GIF 压成首帧 JPEG。"""
+        fmt = self._emo_fmt(data)
+        if fmt == "wxgf":
+            jpg = self.wxgf_to_jpg(data)
+            if not jpg:
+                return None
+            data, fmt = jpg, "jpg"
+        if not fmt:
+            return None
+        if fmt == "gif" and len(data) <= 400_000:
+            return data, ".gif"
+        if fmt == "png" and len(data) <= 120_000:
+            return data, ".png"
+        # ffmpeg 出的 JPG 可能以 COM 段开头（ffd8fffe），Word/python-docx 不认，
+        # 所以除了标准 JFIF/Exif 的一律交给 PIL 重编码成标准 JPG。
+        if (fmt == "jpg" and len(data) <= 120_000
+                and data[:4] in (b"\xff\xd8\xff\xe0", b"\xff\xd8\xff\xe1")):
+            return data, ".jpg"
+        shr = self._shrink_image(data, max_px=self.STICKER_MAX_PX)
+        if shr:
+            return shr, ".jpg"
+        return data, "." + fmt
+
+    def attach_inline_stickers(self, msgs: list[dict],
+                               progress: Callable[[float, str], None] | None = None,
+                               cancel: Callable[[], bool] | None = None) -> dict:
+        """给每条 type=47 消息挂 m["img"] = (表情字节, 扩展名)，供 Word 内嵌。"""
+        stats = {"内嵌": 0, "缺失": 0, "跳过": 0, "种类": 0, "总种类": 0}
+        st = [m for m in msgs if m.get("type") == 47]
+        if not st:
+            return stats
+        want: dict[str, int] = {}
+        for m in st:
+            v = self._sticker_md5(m.get("content"))
+            if v:
+                want[v] = want.get(v, 0) + 1
+        stats["总种类"] = len(want)
+        if not want:
+            stats["缺失"] = len(st)
+            self.log("表情：消息里没有 md5，跳过")
+            return stats
+        acc = self._account_wxid()
+        uin = self._emoticon_uin()
+        root = self._find_attach_root()
+        if uin is None and acc and root:
+            got = self.derive_image_key(acc, root / "attach",
+                                        progress=progress, cancel=cancel)
+            if got:
+                self.image_uin = got[2]
+                uin = got[2]
+        if uin is None or not acc:
+            self.log("表情：没拿到解密种子（需要微信里打开过图片/表情），这次用「[表情]」占位")
+            stats["缺失"] = len(st)
+            return stats
+        key = self._emoticon_key(uin, acc)
+        blobs = self._scan_sticker_blobs(set(want), key, progress, cancel)
+        stats["种类"] = len(blobs)
+        total = len(st)
+        for i, m in enumerate(st, 1):
+            if cancel and cancel():
+                raise ExportCancelled("已取消")
+            if progress and (i % 20 == 0 or i == total):
+                progress(i * 100.0 / total, f"正在内嵌表情 {i}/{total}")
+            v = self._sticker_md5(m.get("content"))
+            data = blobs.get(v) if v else None
+            if not data:
+                stats["缺失"] += 1
+                continue
+            out = self._sticker_image(data)
+            if not out:
+                stats["跳过"] += 1
+                continue
+            m["img"] = out
+            m["img_kind"] = "sticker"
+            stats["内嵌"] += 1
+        self.log(f"  表情：内嵌 {stats['内嵌']} 条（本机有 {stats['种类']}/{stats['总种类']} 种），"
+                 f"本机没有 {stats['缺失']} 条、解不开 {stats['跳过']} 条")
         return stats
 
     # ---- 表情包（账号级，AES-128-CBC key=IV）----
